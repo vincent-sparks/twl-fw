@@ -32,9 +32,9 @@ type PossiblyFakeClient = tests::FakeClient;
 pub struct InteractionHandler {
     pub client: Arc<PossiblyFakeClient>,
     commands: &'static CommandMap,
-    modal_waiters: Mutex<HashMap<String, oneshot::Sender<ModalInteractionData>>>,
-    message_waiters: Mutex<HashMap<String, oneshot::Sender<MessageComponentInteractionData>>>,
-    message_waiters_multishot: Mutex<HashMap<String, mpsc::Sender<MessageComponentInteractionData>>>,
+    modal_waiters: Mutex<HashMap<String, oneshot::Sender<(Interaction, ModalInteractionData)>>>,
+    message_waiters: Mutex<HashMap<String, oneshot::Sender<(Interaction, MessageComponentInteractionData)>>>,
+    message_waiters_multishot: Mutex<HashMap<String, mpsc::Sender<(Interaction, MessageComponentInteractionData)>>>,
     
     current_command_id: AtomicUsize,
     command_id_mappings: Mutex<_CommandIDMappings>,
@@ -148,13 +148,13 @@ impl InteractionHandler {
             },
             InteractionData::ModalSubmit(modal) => {
                 let waiter = unwrap_or_log!(self.modal_waiters.lock().await.remove(&modal.custom_id), "unknown custom id: {}", &modal.custom_id);
-                unwrap_or_log!(waiter.send(modal).ok(), "task was cancelled while waiting for an interaction");
+                unwrap_or_log!(waiter.send((interaction, modal)).ok(), "task was cancelled while waiting for an interaction");
             },
             InteractionData::MessageComponent(message) => {
                 let mut waiters = self.message_waiters_multishot.lock().await;
                 let id = message.custom_id.clone();
                 let waiter = unwrap_or_log!(waiters.get_mut(&message.custom_id), "unknown custom id: {}", &message.custom_id);
-                if waiter.send(message).await.is_err() {
+                if waiter.send((interaction, message)).await.is_err() {
                     // the task dropped the receiver, which means they no longer care.
                     waiters.remove(&id);
                     // ... and clear the interaction buttons from the message.
@@ -164,7 +164,7 @@ impl InteractionHandler {
             _ => todo!(),
         }
     }
-    pub async fn show_modal(&self, interaction: &Interaction, fields: Vec<TextInput>, id: &'static str) -> Result<ModalInteractionData, twilight_http::Error> {
+    pub async fn show_modal(&self, interaction: &Interaction, fields: Vec<TextInput>, id: &'static str) -> Result<(Interaction, ModalInteractionData), twilight_http::Error> {
         let components: Vec<Component> = fields.into_iter().map(Component::TextInput).collect();
         let (sender, receiver) = oneshot::channel();
         let custom_id = build_custom_id(id);
@@ -180,9 +180,14 @@ impl InteractionHandler {
         // receiver wil only fail if the sender is dropped before it sends
         // that can theoretically only happen if self gets dropped while a future that depends on
         // it is still running
-        Ok(receiver.await.unwrap())
+        let (inter, response) = receiver.await.unwrap();
+        let mut mappings = self.command_id_mappings.lock().await;
+        let cmd_id = mappings.interaction_id_to_command_id.remove(&interaction.id).expect("callback disappeared from inter->command mapping");
+        mappings.command_id_to_interaction.insert(cmd_id, (inter.id, inter.token.clone()));
+        mappings.interaction_id_to_command_id.insert(inter.id, cmd_id);
+        Ok((inter, response))
     }
-    pub async fn send_response_with_components(&self, interaction: &Interaction, mut response: InteractionResponseData) -> Result<MessageComponentInteractionData, twilight_http::Error> {
+    pub async fn send_response_with_components(&self, interaction: &Interaction, mut response: InteractionResponseData) -> Result<(Interaction, MessageComponentInteractionData), twilight_http::Error> {
         if response.custom_id.is_none() {
             response.custom_id = Some(build_custom_id(""));
         }
@@ -192,7 +197,7 @@ impl InteractionHandler {
         Ok(receiver.await.unwrap())
     }
 
-    pub async fn manually_add_component_interaction_waiter(&self, custom_id: String) -> oneshot::Receiver<MessageComponentInteractionData> {
+    pub async fn manually_add_component_interaction_waiter(&self, custom_id: String) -> oneshot::Receiver<(Interaction, MessageComponentInteractionData)> {
         let (sender, receiver) = oneshot::channel();
         self.message_waiters.lock().await.insert(custom_id, sender);
         receiver
@@ -250,11 +255,8 @@ pub mod tests {
             Box::pin(self.create_response_real(inter_id, token, resp))
         }
         async fn create_response_real(&self, inter_id: Id<InteractionMarker>, token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
-            println!("create_response invoked");
             if let Some(f) = self.0.reply_fn.as_ref() {
-                println!("found a function");
                 if let Some(inter) = f(inter_id, &resp) {
-                    println!("injecting second future");
                     let handler = self.0.handler.clone().unwrap().upgrade().unwrap();
                     tokio::spawn(handler.handle(inter));
                 }
@@ -380,6 +382,9 @@ pub mod tests {
     fn test_modal_show() {
         let mut handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
         let handler_weak = Arc::downgrade(&handler);
+        // SAFETY: no weak references are either dereferenced or borrowed before handler_mut is
+        // dropped.  Ownership of handler_weak is transferred into client_mut.  No borrow occurs,
+        // therefore safe.
         let handler_mut = unsafe {Arc::get_mut_unchecked(&mut handler)};
         let client_mut = Arc::get_mut(&mut handler_mut.client).unwrap();
         client_mut.handler = Some(handler_weak);
@@ -439,18 +444,15 @@ pub mod tests {
                 token: "".into(),
                 user: None,
             }).await;
-            let mut resps = handler.client.interaction_responses.try_lock().expect("application held onto the lock");
-            let resp = resps.pop().expect("application did not reply to modal command");
-            println!("yo");
-            std::mem::drop(resps);
-
         }));
         let handler = Arc::into_inner(handler).expect("outsanding references to the handler");
         let client = Arc::into_inner(handler.client).expect("outsanding references to the client");
 
         let resps = client.interaction_responses.into_inner();
-        assert_eq!(resps.len(), 1);
-        if resps[0].1.kind != InteractionResponseType::ChannelMessageWithSource {
+        if resps.len() != 2 {
+            panic!("expected two entries, found {}: {:?}", resps.len(), resps);
+        }
+        if resps[1].1.kind != InteractionResponseType::ChannelMessageWithSource {
             panic!("expected an error message, got {:?}", resps[0].1);
         }
     }
