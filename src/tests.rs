@@ -31,22 +31,54 @@ static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| 
                 url:None,
             }),
         ]}),
+    ]).build(), {
+        move |h: Arc<InteractionHandler>, inter: Interaction, data: MessageComponentInteractionData| Box::pin({
+            async move {
+                let _ = h.send_response(&inter, InteractionResponseDataBuilder::new().content("heyo").build()).await;
+                println!("just handled interaction no. {}", inter.id.get());
+                if inter.id.get() == 4 {
+                    h.unhook_component_listener(&data.custom_id).await;
+                }
+                println!("comp. callback done, h ref count: {} weak count: {}", Arc::strong_count(&h), Arc::weak_count(&h));
+                Ok(())
+            }
+        })
+    }).await.unwrap();
+    Ok(())
+});
+
+/*
+static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
+    let count = Arc::new(AtomicUsize::new(0));
+    let r = h.send_response_with_components(&inter, InteractionResponseDataBuilder::new().components(vec![
+        Component::ActionRow(ActionRow{components: vec![
+            Component::Button(Button {
+                custom_id: Some("yeet".into()),
+                disabled: false,
+                emoji: None,
+                label: Some("yo".into()),
+                style: ButtonStyle::Primary,
+                url:None,
+            }),
+        ]}),
     ]).build(), Box::new({
-        let h = h.clone();
-        move |inter, data| {
-            let h = h.clone();
+        move |h: Arc<InteractionHandler>, inter: Interaction, data: MessageComponentInteractionData| Box::pin({
             let count = count.clone();
-            tokio::spawn(async move {
+            async move {
                 let this = count.fetch_add(1, Ordering::Relaxed);
                 let _ = h.send_response(&inter, InteractionResponseDataBuilder::new().content("heyo").build()).await;
-                //println!("just handled interaction no. {}", this);
+                println!("just handled interaction no. {}", this);
                 if this == 2 {
                     h.unhook_component_listener(&data.custom_id).await;
                 }
-            });
-    }})).await.unwrap();
+                println!("comp. callback done, h ref count: {} weak count: {}", Arc::strong_count(&h), Arc::weak_count(&h));
+                Ok(())
+            }
+        })
+    })).await.unwrap();
     Ok(())
 });
+*/
 
 use twilight_model::id::marker::ApplicationMarker;
 use twilight_model::application::command::CommandType;
@@ -78,7 +110,7 @@ impl<'a> FakeInteraction<'a> {
     pub fn create_response<'b>(&'b self, inter_id: Id<InteractionMarker>, token: &'b str, resp: &'b InteractionResponse) -> Pin<Box<dyn Future<Output=Result<(), twilight_http::Error>> + Send + 'b>> {
         Box::pin(self.create_response_real(inter_id, token, resp))
     }
-    async fn create_response_real(&self, inter_id: Id<InteractionMarker>, token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
+    async fn create_response_real(&self, inter_id: Id<InteractionMarker>, _token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
         if let Some(f) = self.0.reply_fn.as_ref() {
             for inter in f(inter_id, &resp) {
                 let handler = self.0.handler.clone().unwrap().upgrade().unwrap();
@@ -89,7 +121,7 @@ impl<'a> FakeInteraction<'a> {
         self.0.interaction_responses.lock().await.push((inter_id, resp.clone()));
         Ok(())
     }
-    pub async fn update_response(&self, token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
+    pub async fn update_response(&self, _token: &str, _resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
         Ok(())
     }
 }
@@ -392,13 +424,16 @@ fn test_message_components() {
             token: "".into(),
             user: None,
         }).await;
+        println!("first handle() completed ok");
         let mut join_set = h.client.tasks.lock().await;
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result {
                 panic!("{}", e);
             }
+            println!("task exiting, h strong count: {} weak count: {}", Arc::strong_count(&h), Arc::weak_count(&h));
         }
         std::mem::drop(join_set);
+        println!("join set done, h strong count: {} weak count: {}", Arc::strong_count(&h), Arc::weak_count(&h));
         std::mem::drop(h);
     }));
     let handler = Arc::into_inner(handler).expect("outsanding references to the handler");
