@@ -39,7 +39,7 @@ static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| 
             tokio::spawn(async move {
                 let this = count.fetch_add(1, Ordering::Relaxed);
                 let _ = h.send_response(&inter, InteractionResponseDataBuilder::new().content("heyo").build()).await;
-                println!("just handled interaction no. {}", this);
+                //println!("just handled interaction no. {}", this);
                 if this == 2 {
                     h.unhook_component_listener(&data.custom_id).await;
                 }
@@ -84,7 +84,6 @@ impl<'a> FakeInteraction<'a> {
                 let handler = self.0.handler.clone().unwrap().upgrade().unwrap();
                 let mut task = self.0.tasks.lock().await;
                 task.spawn(handler.handle(inter));
-                println!("spawned a task, now in queue: {}", task.len());
             }
         }
         self.0.interaction_responses.lock().await.push((inter_id, resp.clone()));
@@ -270,9 +269,6 @@ fn test_modal_show() {
             token: "".into(),
             user: None,
         }).await;
-        println!("after handle()");
-        println!("current ref count: {}", Arc::strong_count(&h));
-        println!("current weak count: {}", Arc::weak_count(&h));
         std::mem::drop(h);
     }));
     let handler = Arc::into_inner(handler).expect("outsanding references to the handler");
@@ -371,9 +367,6 @@ fn test_message_components() {
     let _a = rt.enter();
     let h = handler.clone();
     let _ = rt.block_on(tokio::time::timeout(Duration::from_secs(5), async {
-        println!("starting main future");
-        println!("current ref count: {}", Arc::strong_count(&h));
-        println!("current weak count: {}", Arc::weak_count(&h));
         #[allow(deprecated)]
         h.clone().handle(Interaction {
             app_permissions: None,
@@ -399,11 +392,8 @@ fn test_message_components() {
             token: "".into(),
             user: None,
         }).await;
-        println!("current ref count: {}", Arc::strong_count(&h));
-        println!("current weak count: {}", Arc::weak_count(&h));
         let mut join_set = h.client.tasks.lock().await;
         while let Some(result) = join_set.join_next().await {
-            println!("joining a task");
             if let Err(e) = result {
                 panic!("{}", e);
             }
@@ -411,8 +401,6 @@ fn test_message_components() {
         std::mem::drop(join_set);
         std::mem::drop(h);
     }));
-    println!("current ref count: {}", Arc::strong_count(&handler));
-    println!("current weak count: {}", Arc::weak_count(&handler));
     let handler = Arc::into_inner(handler).expect("outsanding references to the handler");
     let client = Arc::into_inner(handler.client).expect("outsanding references to the client");
 

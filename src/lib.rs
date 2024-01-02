@@ -112,14 +112,8 @@ impl InteractionHandler {
                     mappings.command_id_to_interaction.insert(id, (interaction.id, interaction.token.clone()));
                     std::mem::drop(mappings);
 
-                    println!("before launching task");
-                    println!("current ref count: {}", Arc::strong_count(&self));
-                    println!("current weak count: {}", Arc::weak_count(&self));
                     let this = self.clone();
                     let fut = func(self.clone(), interaction, *data);
-                    println!("after launching task");
-                    println!("current ref count: {}", Arc::strong_count(&self));
-                    println!("current weak count: {}", Arc::weak_count(&self));
                     let fut = async move {
                         let res = fut.await;
 
@@ -148,9 +142,6 @@ impl InteractionHandler {
                     fut.await;
                     #[cfg(not(test))]
                     tokio::spawn(fut);
-                    println!("after finishing task");
-                    println!("current ref count: {}", Arc::strong_count(&self));
-                    println!("current weak count: {}", Arc::weak_count(&self));
                 }
             },
             InteractionData::ModalSubmit(modal) => {
@@ -164,9 +155,6 @@ impl InteractionHandler {
             },
             _ => todo!(),
         }
-        println!("exiting handle()");
-        println!("current ref count: {}", Arc::strong_count(&self));
-        println!("current weak count: {}", Arc::weak_count(&self));
     }
     pub async fn show_modal(&self, interaction: &Interaction, title: String, fields: Vec<TextInput>, id: &'static str) -> Result<(Interaction, ModalInteractionData), twilight_http::Error> {
         let components: Vec<Component> = fields.into_iter().map(Component::TextInput).collect();
