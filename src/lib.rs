@@ -1,5 +1,6 @@
 #![feature(get_mut_unchecked)]
 pub mod components;
+pub mod util;
 
 use tokio::sync::{oneshot, mpsc, Mutex};
 use twilight_model::application::interaction::{Interaction, InteractionType, InteractionData, application_command::CommandData, modal::ModalInteractionData, message_component::MessageComponentInteractionData};
@@ -117,9 +118,15 @@ impl InteractionHandler {
                 }
             },
             InteractionData::ModalSubmit(modal) => {
-
-                let waiter = unwrap_or_log!(self.modal_waiters_oneshot.lock().await.remove(&modal.custom_id), "unknown custom id for a modal: {}", &modal.custom_id);
-                unwrap_or_log!(waiter.send((interaction, modal)).ok(), "task was cancelled while waiting for an interaction");
+                let guard = self.modal_waiters_permanent.lock().await;
+                let task = guard.get(&modal.custom_id).map(|x|*x);
+                std::mem::drop(guard);
+                if let Some(task) = task {
+                    self.launch_task(interaction, task, modal).await;
+                } else {
+                    let waiter = unwrap_or_log!(self.modal_waiters_oneshot.lock().await.remove(&modal.custom_id), "unknown custom id for a modal: {}", &modal.custom_id);
+                    unwrap_or_log!(waiter.send((interaction, modal)).ok(), "task was cancelled while waiting for an interaction");
+                }
             },
             InteractionData::MessageComponent(message) => {
                 let waiter = *unwrap_or_log!(self.message_waiters.lock().await.get(&message.custom_id), "unknown custom id for message components: {}", &message.custom_id);
@@ -172,8 +179,7 @@ impl InteractionHandler {
         tokio::spawn(fut);
     }
     pub async fn show_modal_permanent(&self, interaction: &Interaction, title: String, fields: Vec<TextInput>, custom_id: &'static str) -> Result<(), twilight_http::Error> {
-        let components: Vec<Component> = fields.into_iter().map(Component::TextInput).collect();
-        let components = vec![Component::ActionRow(ActionRow{components})];
+        let components: Vec<Component> = fields.into_iter().map(|x| Component::ActionRow(ActionRow {components: vec![Component::TextInput(x)]})).collect();
         debug_assert!(self.modal_waiters_permanent.lock().await.get(custom_id).is_some());
         self.client.interaction(interaction.application_id).create_response(interaction.id, &interaction.token, &InteractionResponse {
             kind: InteractionResponseType::Modal,
@@ -246,6 +252,14 @@ impl InteractionHandler {
 
     pub async fn unhook_component_listener(&self, custom_id: &str) {
         self.message_waiters.lock().await.remove(custom_id);
+    }
+
+    pub async fn add_modal_listener(&self, custom_id: String, callback: fn(Arc<Self>, Interaction, ModalInteractionData) -> CommandFuture) {
+        self.modal_waiters_permanent.lock().await.insert(custom_id, callback);
+
+    }
+    pub async fn unhook_modal_listener(&self, custom_id: &str) {
+        self.modal_waiters_permanent.lock().await.remove(custom_id);
     }
 }
 

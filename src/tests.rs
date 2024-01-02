@@ -1,6 +1,18 @@
 use super::*;
+use crate::util::unwrap_modal;
+use crate::util::TextInputBuilder;
 use phf::phf_map;
 use std::time::Duration;
+use serde::Deserialize;
+use twilight_model::channel::message::component::TextInputStyle;
+use twilight_model::application::interaction::modal::{ModalInteractionDataActionRow, ModalInteractionDataComponent, ModalInteractionData};
+
+#[derive(Deserialize, Debug)]
+struct ModalResult {
+    val1: String,
+    val2: String,
+}
+
 use twilight_model::channel::message::component::{Button, ButtonStyle, ComponentType};
 static ERROR_COMMAND: Lazy<CommandFunc> = build_command!(|_client, _inter, __data| async {anyhow::bail!("yeet");});
 static HELLO_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
@@ -13,7 +25,11 @@ static HELLO_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async
 });
 
 static MODAL_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
-    let r = h.show_modal(&inter, String::from("yeet"), vec![], "showin the modal").await.unwrap();
+    let (_inter, modal) = h.show_modal(&inter, String::from("yeet"), vec![
+                                       TextInputBuilder::new("Value 1", "val1", TextInputStyle::Short).build(),
+                                       TextInputBuilder::new("Value 2", "val2", TextInputStyle::Paragraph).build(),
+    ], "showin the modal").await.unwrap();
+    let r: ModalResult = unwrap_modal(modal).unwrap();
     dbg!(r);
     anyhow::bail!("yeet");
 });
@@ -256,7 +272,10 @@ fn test_modal_show() {
                 channel_id: None,
                 data: Some(InteractionData::ModalSubmit(ModalInteractionData {
                     custom_id: resp.data.as_ref().expect("command response had no dtaa").custom_id.clone().expect("app did not provide a custom ID on the modal"),
-                    components: vec![],
+                    components: vec![
+                        ModalInteractionDataActionRow {components: vec![ModalInteractionDataComponent {custom_id: "val1".into(), value: Some("Value 1".into()), kind: ComponentType::TextInput}]},
+                        ModalInteractionDataActionRow {components: vec![ModalInteractionDataComponent {custom_id: "val2".into(), value: Some("Paragraph answer for value 2".into()), kind: ComponentType::TextInput}]},
+                    ],
                 })),
                 guild_id: None,
                 guild_locale: None,
