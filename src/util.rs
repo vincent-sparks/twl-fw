@@ -108,3 +108,67 @@ impl TextInputBuilder {
     }
 
 }
+
+#[macro_export]
+macro_rules! components  {
+    [$($item:expr),+] => {
+         vec![$(::twilight_model::channel::message::component::Component::from($item)),*]
+    }
+}
+
+#[macro_export]
+macro_rules! action_row  {
+    [$($item:expr),*] => {
+         ::twilight_model::channel::message::component::ActionRow{ components: vec![$($item.into()),*]}
+    }
+}
+
+#[macro_export]
+macro_rules! _disabled_helper {
+    ($val: expr) => {$val};
+    () => {false};
+}
+
+#[macro_export]
+macro_rules! _option_helper {
+    ($val: expr) => {Some($val.into())};
+    () => {None};
+}
+
+#[macro_export]
+macro_rules! button  {
+    (style: $style:ident $(,label: $label: expr)? $(,emoji: $emoji: expr)? $(,disabled: $disabled:expr)? $(, id: $id:expr)?) => { 
+        ::twilight_model::channel::message::component::Button {
+            disabled: $crate::_disabled_helper!($($disabled)?),
+            label: $crate::_option_helper!($($label)?),
+            emoji: $crate::_option_helper!($($emoji)?),
+            custom_id: $crate::_option_helper!($($id)?),
+            style: ::twilight_model::channel::message::component::ButtonStyle::$style,
+            url: None,
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! link_button  {
+    (url: $url:expr $(,label: $label: expr)? $(,emoji: $emoji: expr)? $(,disabled: $disabled:expr)?) => { 
+        ::twilight_model::channel::message::component::Button {
+            disabled: $crate::_disabled_helper!($($disabled)?),
+            label: $crate::_option_helper!($($label)?),
+            emoji: $crate::_option_helper!($($emoji)?),
+            custom_id: None,
+            style: ::twilight_model::channel::message::component::ButtonStyle::$style,
+            url: Some($url.into()),
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! response {
+    (ephemeral; $client: expr, $inter: expr, $($args:tt)*) => {
+        $client.send_response(&$inter, InteractionResponseDataBuilder::new().content(format!($($args)*)).flags(MessageFlags::EPHEMERAL).build()).await?;
+    };
+    ($client: expr, $inter: expr, $($args:tt)*) => {
+        $client.send_response(&$inter, InteractionResponseDataBuilder::new().content(format!($($args)*)).build()).await?;
+    };
+}

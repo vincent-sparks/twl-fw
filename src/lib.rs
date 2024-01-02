@@ -1,8 +1,8 @@
 #![feature(get_mut_unchecked)]
-pub mod components;
 pub mod util;
 
 use tokio::sync::{oneshot, mpsc, Mutex};
+use twilight_gateway::Event;
 use twilight_model::application::interaction::{Interaction, InteractionType, InteractionData, application_command::CommandData, modal::ModalInteractionData, message_component::MessageComponentInteractionData};
 use tracing::{info};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
@@ -17,6 +17,8 @@ use std::pin::Pin;
 use std::ops::Deref;
 use rand::{thread_rng, seq::SliceRandom};
 use once_cell::sync::Lazy;
+#[cfg(feature="twilight-cache-inmemory")]
+use twilight_cache_inmemory::InMemoryCache;
 
 pub type CommandFuture = Pin<Box<dyn Future<Output=anyhow::Result<()>> + Send>>;
 
@@ -37,9 +39,12 @@ type PossiblyFakeClient = tests::FakeClient;
 
 pub struct InteractionHandler {
     pub client: Arc<PossiblyFakeClient>,
+    #[cfg(feature="twilight-cache-inmemory")]
+    cache: InMemoryCache,
     commands: &'static CommandMap,
     modal_waiters_oneshot: Mutex<HashMap<String, oneshot::Sender<(Interaction, ModalInteractionData)>>>,
     modal_waiters_permanent: Mutex<HashMap<String, fn(Arc<Self>, Interaction, ModalInteractionData) -> CommandFuture>>,
+    message_waiters_oneshot: Mutex<HashMap<String, oneshot::Sender<(Interaction, MessageComponentInteractionData)>>>,
     message_waiters: Mutex<HashMap<String, fn(Arc<Self>, Interaction, MessageComponentInteractionData) -> CommandFuture>>,
     
     current_command_id: AtomicUsize,
@@ -60,8 +65,8 @@ fn build_custom_id(ctx: &str) -> String {
 
 macro_rules! log_err {
     ($expr:expr, $message: literal $(, $arg: expr)*) => {
-        if let Err(e) = $expr {
-            tracing::error!(?e, $message $(, $arg)*);
+        if let Err(error) = $expr {
+            tracing::error!(?error, $message $(, $arg)*);
         }
     }
 }
@@ -89,12 +94,29 @@ impl InteractionHandler {
     pub fn new(client: Arc<PossiblyFakeClient>, commands: &'static CommandMap) -> Self {
         Self {
             client, commands,
+            #[cfg(feature="twilight-cache-inmemory")]
+            cache: InMemoryCache::new(),
             current_command_id: AtomicUsize::new(0),
+            message_waiters_oneshot: Default::default(),
             message_waiters: Default::default(),
             modal_waiters_oneshot: Default::default(),
             modal_waiters_permanent: Default::default(),
             command_id_mappings: Default::default(),
         }
+    }
+
+    pub async fn on_event(self: Arc<Self>, evt: Event) {
+        #[cfg(feature="twilight-cache-inmemory")]
+        self.cache.update(&evt);
+        match evt {
+            Event::InteractionCreate(inter) => self.handle(inter.0).await,
+            _ => {},
+        }
+    }
+
+    #[cfg(feature="twilight-cache-inmemory")]
+    pub fn cache(&self) -> &InMemoryCache {
+        &self.cache
     }
 
     pub async fn handle(self: Arc<Self>, mut interaction: Interaction) {
@@ -118,8 +140,9 @@ impl InteractionHandler {
                 }
             },
             InteractionData::ModalSubmit(modal) => {
+                let (module, arg) = modal.custom_id.split_once(':').unwrap_or((&modal.custom_id, ""));
                 let guard = self.modal_waiters_permanent.lock().await;
-                let task = guard.get(&modal.custom_id).map(|x|*x);
+                let task = guard.get(module).map(|x|*x);
                 std::mem::drop(guard);
                 if let Some(task) = task {
                     self.launch_task(interaction, task, modal).await;
@@ -129,8 +152,15 @@ impl InteractionHandler {
                 }
             },
             InteractionData::MessageComponent(message) => {
-                let waiter = *unwrap_or_log!(self.message_waiters.lock().await.get(&message.custom_id), "unknown custom id for message components: {}", &message.custom_id);
-                self.launch_task(interaction, waiter, message).await;
+                let (module, arg) = message.custom_id.split_once(':').unwrap_or((&message.custom_id, ""));
+                if module == "oneshot" {
+                    let sender = unwrap_or_log!(self.message_waiters_oneshot.lock().await.remove(arg), "oneshot components waiter for {} disappeared", &message.custom_id);
+                    let id = message.custom_id.clone();
+                    unwrap_or_log!(sender.send((interaction, message)).ok(), "oneshot components receiver for {} was dropped before receiving", id); 
+                } else {
+                    let waiter = *unwrap_or_log!(self.message_waiters.lock().await.get(module), "unknown custom id for message components: {}", &message.custom_id);
+                    self.launch_task(interaction, waiter, message).await;
+                }
             },
             _ => todo!(),
         }
@@ -146,12 +176,11 @@ impl InteractionHandler {
         mappings.command_id_to_interaction.insert(id, (interaction.id, interaction.token.clone()));
         std::mem::drop(mappings);
 
-        let this = self.clone();
         let fut = func(self.clone(), interaction, data);
         let fut = async move {
             let res = fut.await;
 
-            let mut mappings = this.command_id_mappings.lock().await;
+            let mut mappings = self.command_id_mappings.lock().await;
             let inter = mappings.command_id_to_interaction.remove(&id);
 
             if let Some((id, _)) = &inter {
@@ -162,12 +191,12 @@ impl InteractionHandler {
             if let Err(e) = res {
                 tracing::error!(?e, "error in command");
                 if let Some((id, token)) = inter {
-                    log_err!(this.client.interaction(app_id).create_response(id, &token, &InteractionResponse {
+                    log_err!(self.client.interaction(app_id).create_response(id, &token, &InteractionResponse {
                         kind: InteractionResponseType::ChannelMessageWithSource,
                         data: Some(InteractionResponseDataBuilder::new()
                                    .content(format!("Internal error! {}", e))
                                    .build()),
-                    }).await, "error notifying user of error: {}", e);
+                    }).await, "error notifying user of error, original error: {}", e);
                 } else {
                     tracing::error!(?e, "an error occurred in a slash command but no interaction was present to report it");
                 }
@@ -178,15 +207,15 @@ impl InteractionHandler {
         #[cfg(not(test))]
         tokio::spawn(fut);
     }
-    pub async fn show_modal_permanent(&self, interaction: &Interaction, title: String, fields: Vec<TextInput>, custom_id: &'static str) -> Result<(), twilight_http::Error> {
+    pub async fn show_modal_permanent(&self, interaction: &Interaction, title: impl AsRef<str>, fields: Vec<TextInput>, custom_id: impl AsRef<str>) -> Result<(), twilight_http::Error> {
         let components: Vec<Component> = fields.into_iter().map(|x| Component::ActionRow(ActionRow {components: vec![Component::TextInput(x)]})).collect();
-        debug_assert!(self.modal_waiters_permanent.lock().await.get(custom_id).is_some());
+        debug_assert!(self.modal_waiters_permanent.lock().await.get(custom_id.as_ref()).is_some());
         self.client.interaction(interaction.application_id).create_response(interaction.id, &interaction.token, &InteractionResponse {
             kind: InteractionResponseType::Modal,
             data: Some(InteractionResponseDataBuilder::new()
-                       .title(title)
+                       .title(title.as_ref())
                        .components(components)
-                       .custom_id(custom_id)
+                       .custom_id(custom_id.as_ref())
                        .build()),
         }).await?;
         Ok(())
@@ -203,7 +232,7 @@ impl InteractionHandler {
             data: Some(InteractionResponseDataBuilder::new()
                        .title(title)
                        .components(components)
-                       .custom_id(custom_id)
+                       .custom_id(format!("oneshot:{}", custom_id))
                        .build()),
         }).await?;
 
@@ -237,17 +266,16 @@ impl InteractionHandler {
         self.client.interaction(interaction.application_id).create_response(interaction.id, &interaction.token, &InteractionResponse {kind: InteractionResponseType::ChannelMessageWithSource, data: Some(response)}).await?;
         Ok(())
     }
-    pub async fn send_response_with_components(&self, interaction: &Interaction, mut response: InteractionResponseData, callback: fn(Arc<Self>, Interaction, MessageComponentInteractionData) -> CommandFuture) -> Result<(), twilight_http::Error> {
-        if response.custom_id.is_none() {
-            response.custom_id = Some(build_custom_id(""));
-        }
-        self.message_waiters.lock().await.insert(response.custom_id.clone().unwrap(), callback);
-        self.send_response(&interaction, response).await?;
-        Ok(())
+
+    pub async fn oneshot_component_listener(&self, debug_message: &str) -> (String, oneshot::Receiver<(Interaction, MessageComponentInteractionData)>) {
+        let custom_id = build_custom_id(debug_message);
+        let (sender, receiver) = oneshot::channel();
+        self.message_waiters_oneshot.lock().await.insert(custom_id.clone(), sender);
+        (format!("oneshot:{}", custom_id), receiver)
     }
 
-    pub async fn add_component_interaction_waiter(&self, custom_id: String, callback: fn(Arc<Self>, Interaction, MessageComponentInteractionData) -> CommandFuture) {
-        self.message_waiters.lock().await.insert(custom_id, callback);
+    pub async fn add_component_listener(&self, custom_id: impl Into<String>, callback: fn(Arc<Self>, Interaction, MessageComponentInteractionData) -> CommandFuture) {
+        self.message_waiters.lock().await.insert(custom_id.into(), callback);
     }
 
     pub async fn unhook_component_listener(&self, custom_id: &str) {

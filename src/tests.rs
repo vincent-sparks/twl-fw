@@ -1,19 +1,23 @@
 use super::*;
 use crate::util::unwrap_modal;
 use crate::util::TextInputBuilder;
+use crate::{components, action_row, button};
 use phf::phf_map;
 use std::time::Duration;
 use serde::Deserialize;
 use twilight_model::channel::message::component::TextInputStyle;
 use twilight_model::application::interaction::modal::{ModalInteractionDataActionRow, ModalInteractionDataComponent, ModalInteractionData};
+use guard::guard;
 
 #[derive(Deserialize, Debug)]
 struct ModalResult {
+    #[allow(unused)]
     val1: String,
+    #[allow(unused)]
     val2: String,
 }
 
-use twilight_model::channel::message::component::{Button, ButtonStyle, ComponentType};
+use twilight_model::channel::message::component::ComponentType;
 static ERROR_COMMAND: Lazy<CommandFunc> = build_command!(|_client, _inter, __data| async {anyhow::bail!("yeet");});
 static HELLO_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
     h.client.interaction(inter.application_id).create_response(inter.id, &inter.token, 
@@ -34,21 +38,8 @@ static MODAL_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async
     anyhow::bail!("yeet");
 });
 
-static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
-    let count = Arc::new(AtomicUsize::new(0));
-    let r = h.send_response_with_components(&inter, InteractionResponseDataBuilder::new().components(vec![
-        Component::ActionRow(ActionRow{components: vec![
-            Component::Button(Button {
-                custom_id: Some("yeet".into()),
-                disabled: false,
-                emoji: None,
-                label: Some("yo".into()),
-                style: ButtonStyle::Primary,
-                url:None,
-            }),
-        ]}),
-    ]).build(), {
-        move |h: Arc<InteractionHandler>, inter: Interaction, data: MessageComponentInteractionData| Box::pin({
+fn button_handler(h: Arc<InteractionHandler>, inter: Interaction, data: MessageComponentInteractionData) -> CommandFuture {
+    Box::pin({
             async move {
                 let _ = h.send_response(&inter, InteractionResponseDataBuilder::new().content("heyo").build()).await;
                 println!("just handled interaction no. {}", inter.id.get());
@@ -59,7 +50,19 @@ static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| 
                 Ok(())
             }
         })
-    }).await.unwrap();
+}
+
+static COMPONENTS_COMMAND: Lazy<CommandFunc> = build_command!(|h, inter, _data| async move {
+    let count = Arc::new(AtomicUsize::new(0));
+    h.add_component_listener("button1", button_handler).await;
+    let r = h.send_response(&inter, InteractionResponseDataBuilder::new().components(components![
+        action_row![
+            button!(style: Primary, label: "hello world", id: "button1"),
+            button!(style: Primary, label: "yeet lol", disabled: true, id: "button2")
+        ]
+    ]).build()).await.unwrap();
+ {
+    }
     Ok(())
 });
 
@@ -347,7 +350,12 @@ fn test_message_components() {
     client_mut.reply_fn = Some(Box::new(|id, resp| {
         println!("replying to: {}", id);
         if id.get() == 1 {
-            let cid = resp.data.as_ref().expect("command response had no data").custom_id.clone().expect("app did not provide a custom ID on the message");
+            let data = resp.data.as_ref().expect("command response had no data");
+            assert!(data.custom_id.is_none(), "the buttons should have a custom ID, not the message");
+            let first_row = &data.components.as_ref().expect("command response has no components")[0];
+            guard!(let Component::ActionRow(row) = first_row else {panic!("only ActionRows are allowed at the top level")});
+            guard!(let Component::Button(button) = &row.components[0] else {panic!("first element in first row was expected to be a button")});
+            let cid = button.custom_id.as_ref().expect("button did not have a custom ID");
             vec![
                 #[allow(deprecated)] Interaction {
                 app_permissions: None,
@@ -357,7 +365,7 @@ fn test_message_components() {
                 data: Some(InteractionData::MessageComponent(MessageComponentInteractionData {
                     custom_id: cid.clone(),
                     values: vec![],
-                    component_type: ComponentType::ActionRow,
+                    component_type: ComponentType::Button,
                 })),
                 guild_id: None,
                 guild_locale: None,
@@ -377,7 +385,7 @@ fn test_message_components() {
                 data: Some(InteractionData::MessageComponent(MessageComponentInteractionData {
                     custom_id: cid.clone(),
                     values: vec![],
-                    component_type: ComponentType::ActionRow,
+                    component_type: ComponentType::Button,
                 })),
                 guild_id: None,
                 guild_locale: None,
@@ -397,7 +405,7 @@ fn test_message_components() {
                 data: Some(InteractionData::MessageComponent(MessageComponentInteractionData {
                     custom_id: cid.clone(),
                     values: vec![],
-                    component_type: ComponentType::ActionRow,
+                    component_type: ComponentType::Button,
                 })),
                 guild_id: None,
                 guild_locale: None,
