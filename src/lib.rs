@@ -33,8 +33,7 @@ pub struct InteractionHandler {
     pub client: Arc<PossiblyFakeClient>,
     commands: &'static CommandMap,
     modal_waiters: Mutex<HashMap<String, oneshot::Sender<(Interaction, ModalInteractionData)>>>,
-    message_waiters: Mutex<HashMap<String, oneshot::Sender<(Interaction, MessageComponentInteractionData)>>>,
-    message_waiters_multishot: Mutex<HashMap<String, mpsc::Sender<(Interaction, MessageComponentInteractionData)>>>,
+    message_waiters: Mutex<HashMap<String, Box<dyn FnMut(Interaction, MessageComponentInteractionData) -> () + Send>>>,
     
     current_command_id: AtomicUsize,
     command_id_mappings: Mutex<_CommandIDMappings>,
@@ -85,7 +84,6 @@ impl InteractionHandler {
             client, commands,
             current_command_id: AtomicUsize::new(0),
             message_waiters: Default::default(),
-            message_waiters_multishot: Default::default(),
             modal_waiters: Default::default(),
             command_id_mappings: Default::default(),
         }
@@ -114,8 +112,14 @@ impl InteractionHandler {
                     mappings.command_id_to_interaction.insert(id, (interaction.id, interaction.token.clone()));
                     std::mem::drop(mappings);
 
+                    println!("before launching task");
+                    println!("current ref count: {}", Arc::strong_count(&self));
+                    println!("current weak count: {}", Arc::weak_count(&self));
                     let this = self.clone();
                     let fut = func(self.clone(), interaction, *data);
+                    println!("after launching task");
+                    println!("current ref count: {}", Arc::strong_count(&self));
+                    println!("current weak count: {}", Arc::weak_count(&self));
                     let fut = async move {
                         let res = fut.await;
 
@@ -144,25 +148,25 @@ impl InteractionHandler {
                     fut.await;
                     #[cfg(not(test))]
                     tokio::spawn(fut);
+                    println!("after finishing task");
+                    println!("current ref count: {}", Arc::strong_count(&self));
+                    println!("current weak count: {}", Arc::weak_count(&self));
                 }
             },
             InteractionData::ModalSubmit(modal) => {
-                let waiter = unwrap_or_log!(self.modal_waiters.lock().await.remove(&modal.custom_id), "unknown custom id: {}", &modal.custom_id);
+                let waiter = unwrap_or_log!(self.modal_waiters.lock().await.remove(&modal.custom_id), "unknown custom id for a modal: {}", &modal.custom_id);
                 unwrap_or_log!(waiter.send((interaction, modal)).ok(), "task was cancelled while waiting for an interaction");
             },
             InteractionData::MessageComponent(message) => {
-                let mut waiters = self.message_waiters_multishot.lock().await;
-                let id = message.custom_id.clone();
-                let waiter = unwrap_or_log!(waiters.get_mut(&message.custom_id), "unknown custom id: {}", &message.custom_id);
-                if waiter.send((interaction, message)).await.is_err() {
-                    // the task dropped the receiver, which means they no longer care.
-                    waiters.remove(&id);
-                    // ... and clear the interaction buttons from the message.
-                    //log_err!(self.client.interaction(interaction.application_id).update_response(&interaction.token).components(None).unwrap().await, "removing components from message");
-                }
+                let mut waiters = self.message_waiters.lock().await;
+                let waiter = unwrap_or_log!(waiters.get_mut(&message.custom_id), "unknown custom id for message components: {}", &message.custom_id);
+                waiter(interaction, message);
             },
             _ => todo!(),
         }
+        println!("exiting handle()");
+        println!("current ref count: {}", Arc::strong_count(&self));
+        println!("current weak count: {}", Arc::weak_count(&self));
     }
     pub async fn show_modal(&self, interaction: &Interaction, title: String, fields: Vec<TextInput>, id: &'static str) -> Result<(Interaction, ModalInteractionData), twilight_http::Error> {
         let components: Vec<Component> = fields.into_iter().map(Component::TextInput).collect();
@@ -183,28 +187,48 @@ impl InteractionHandler {
         // that can theoretically only happen if self gets dropped while a future that depends on
         // it is still running
         let (inter, response) = receiver.await.unwrap();
+        // now this is where my library does something i think is really cool
+        // see when a command function returns an error value i want to be able to see that in
+        // discord so i don't have to ssh into the server and deal with systemd-journald (assuming
+        // i even set it up as a service) just so i can see what even failed
+        // the way i do that is by remembering the interaction token i give to the application,
+        // and, if the application errors out before using it, the library uses it to send an
+        // error message.
+        // now, interactions are single use.  you can only reply to them once before they become
+        // invalid.  however, discord allows bots to establish dialog by sending certain
+        // interactions (like modals and messages with interactive components) that give you
+        // another interaction back when the user responds.  NOW.  my library has convenience
+        // functions that allow the user to consume the interaction, send a modal, wait for the
+        // user to complete that modal, and get another interaction back.  since this one function
+        // has access to both the before and after interaction ID, I can track it across that
+        // boundary and update my if-the-command-errors-out-use-this-interaction-to-report-the-error
+        // value automatically.  that's what this code does.
         let mut mappings = self.command_id_mappings.lock().await;
         let cmd_id = mappings.interaction_id_to_command_id.remove(&interaction.id).expect("callback disappeared from inter->command mapping");
         mappings.command_id_to_interaction.insert(cmd_id, (inter.id, inter.token.clone()));
         mappings.interaction_id_to_command_id.insert(inter.id, cmd_id);
         Ok((inter, response))
     }
-    pub async fn send_response_with_components(&self, interaction: &Interaction, mut response: InteractionResponseData) -> Result<mpsc::Receiver<(Interaction, MessageComponentInteractionData)>, twilight_http::Error> {
+    pub async fn send_response(&self, interaction: &Interaction, mut response: InteractionResponseData, ) -> Result<(), twilight_http::Error> {
+        self.client.interaction(interaction.application_id).create_response(interaction.id, &interaction.token, &InteractionResponse {kind: InteractionResponseType::ChannelMessageWithSource, data: Some(response)}).await?;
+        Ok(())
+    }
+    pub async fn send_response_with_components(&self, interaction: &Interaction, mut response: InteractionResponseData, callback: Box<dyn FnMut(Interaction, MessageComponentInteractionData) -> () + Send>) -> Result<(), twilight_http::Error> {
         if response.custom_id.is_none() {
             response.custom_id = Some(build_custom_id(""));
         }
-        let (sender, receiver) = mpsc::channel(5);
-        self.message_waiters_multishot.lock().await.insert(response.custom_id.clone().unwrap(), sender);
-        self.client.interaction(interaction.application_id).create_response(interaction.id, &interaction.token, &InteractionResponse {kind: InteractionResponseType::ChannelMessageWithSource, data: Some(response)}).await?;
-        Ok(receiver)
+        self.message_waiters.lock().await.insert(response.custom_id.clone().unwrap(), callback);
+        self.send_response(&interaction, response).await?;
+        Ok(())
     }
 
-    pub async fn manually_add_component_interaction_waiter(&self, custom_id: String) -> oneshot::Receiver<(Interaction, MessageComponentInteractionData)> {
-        let (sender, receiver) = oneshot::channel();
-        self.message_waiters.lock().await.insert(custom_id, sender);
-        receiver
+    pub async fn manually_add_component_interaction_waiter(&self, custom_id: String, callback: Box<dyn FnMut(Interaction, MessageComponentInteractionData) -> () + Send>) {
+        self.message_waiters.lock().await.insert(custom_id, callback);
+    }
+
+    pub async fn unhook_component_listener(&self, custom_id: &str) {
+        self.message_waiters.lock().await.remove(custom_id);
     }
 }
 
-#[cfg(test)]
 pub mod tests;
