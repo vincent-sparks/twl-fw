@@ -1,3 +1,4 @@
+#![feature(get_mut_unchecked)]
 use tokio::sync::{oneshot, mpsc, Mutex};
 use twilight_model::application::interaction::{Interaction, InteractionType, InteractionData, application_command::CommandData, modal::ModalInteractionData, message_component::MessageComponentInteractionData};
 use tracing::{info};
@@ -90,7 +91,7 @@ impl InteractionHandler {
         }
     }
 
-    pub async fn handle(self: &Arc<Self>, mut interaction: Interaction) {
+    pub async fn handle(self: Arc<Self>, mut interaction: Interaction) {
         if interaction.kind == InteractionType::Ping {
             info!("Got a ping from the Discord API");
             let interaction_client = self.client.interaction(interaction.application_id);
@@ -232,6 +233,8 @@ pub mod tests {
     #[derive(Default)]
     pub struct FakeClient {
         interaction_responses: Mutex<Vec<(Id<InteractionMarker>, InteractionResponse)>>,
+        reply_fn: Option<Box<dyn Fn(Id<InteractionMarker>, &InteractionResponse) -> Option<Interaction> + Send + Sync>>,
+        handler: Option<std::sync::Weak<InteractionHandler>>
     }
 
     pub struct FakeInteraction<'a>(&'a FakeClient);
@@ -243,7 +246,19 @@ pub mod tests {
     }
 
     impl<'a> FakeInteraction<'a> {
-        pub async fn create_response(&self, inter_id: Id<InteractionMarker>, token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
+        pub fn create_response<'b>(&'b self, inter_id: Id<InteractionMarker>, token: &'b str, resp: &'b InteractionResponse) -> Pin<Box<dyn Future<Output=Result<(), twilight_http::Error>> + Send + 'b>> {
+            Box::pin(self.create_response_real(inter_id, token, resp))
+        }
+        async fn create_response_real(&self, inter_id: Id<InteractionMarker>, token: &str, resp: &InteractionResponse) -> Result<(), twilight_http::Error> {
+            println!("create_response invoked");
+            if let Some(f) = self.0.reply_fn.as_ref() {
+                println!("found a function");
+                if let Some(inter) = f(inter_id, &resp) {
+                    println!("injecting second future");
+                    let handler = self.0.handler.clone().unwrap().upgrade().unwrap();
+                    tokio::spawn(handler.handle(inter));
+                }
+            }
             self.0.interaction_responses.lock().await.push((inter_id, resp.clone()));
             Ok(())
         }
@@ -255,9 +270,10 @@ pub mod tests {
     #[test]
     fn test_ping_gets_pong() {
         let handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
+        let h = handler.clone();
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
             #[allow(deprecated)]
-            handler.handle(Interaction {
+            h.handle(Interaction {
                 app_permissions: None,
                 application_id: Id::new(1),
                 channel: None,
@@ -285,9 +301,10 @@ pub mod tests {
     #[test]
     fn test_command_response() {
         let handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
+        let h = handler.clone();
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
             #[allow(deprecated)]
-            handler.handle(Interaction {
+            h.handle(Interaction {
                 app_permissions: None,
                 application_id: Id::new(1),
                 channel: None,
@@ -324,9 +341,10 @@ pub mod tests {
         let handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _a = rt.enter();
+        let h = handler.clone();
         let _ = rt.block_on(tokio::time::timeout(Duration::from_secs(5), async {
             #[allow(deprecated)]
-            handler.handle(Interaction {
+            h.handle(Interaction {
                 app_permissions: None,
                 application_id: Id::new(1),
                 channel: None,
@@ -360,12 +378,44 @@ pub mod tests {
     }
     #[test]
     fn test_modal_show() {
-        let handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
+        let mut handler = Arc::new(InteractionHandler::new(Default::default(), &COMMANDS));
+        let handler_weak = Arc::downgrade(&handler);
+        let handler_mut = unsafe {Arc::get_mut_unchecked(&mut handler)};
+        let client_mut = Arc::get_mut(&mut handler_mut.client).unwrap();
+        client_mut.handler = Some(handler_weak);
+        client_mut.reply_fn = Some(Box::new(|id, resp| {
+            println!("replying to: {}", id);
+            if id == Id::new(1001) {
+                #[allow(deprecated)]
+                Some(Interaction {
+                    app_permissions: None,
+                    application_id: Id::new(1),
+                    channel: None,
+                    channel_id: None,
+                    data: Some(InteractionData::ModalSubmit(ModalInteractionData {
+                        custom_id: resp.data.as_ref().expect("command response had no dtaa").custom_id.clone().expect("app did not provide a custom ID on the modal"),
+                        components: vec![],
+                    })),
+                    guild_id: None,
+                    guild_locale: None,
+                    id: Id::new(1),
+                    kind: InteractionType::ModalSubmit,
+                    locale: None,
+                    member: None,
+                    message: None,
+                    token: "yeet lol".into(),
+                    user: None,
+                })
+            } else {
+                None
+            }
+        }));
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _a = rt.enter();
+        let h = handler.clone();
         let _ = rt.block_on(tokio::time::timeout(Duration::from_secs(5), async {
             #[allow(deprecated)]
-            handler.handle(Interaction {
+            h.handle(Interaction {
                 app_permissions: None,
                 application_id: Id::new(1),
                 channel: None,
@@ -381,7 +431,7 @@ pub mod tests {
                 }))),
                 guild_id: None,
                 guild_locale: None,
-                id: Id::new(1),
+                id: Id::new(1001),
                 kind: InteractionType::ApplicationCommand,
                 locale: None,
                 member: None,
@@ -393,26 +443,6 @@ pub mod tests {
             let resp = resps.pop().expect("application did not reply to modal command");
             println!("yo");
             std::mem::drop(resps);
-            #[allow(deprecated)]
-            handler.handle(Interaction {
-                app_permissions: None,
-                application_id: Id::new(1),
-                channel: None,
-                channel_id: None,
-                data: Some(InteractionData::ModalSubmit(ModalInteractionData {
-                    custom_id: resp.1.data.expect("command response had no dtaa").custom_id.expect("app did not provide a custom ID on the modal"),
-                    components: vec![],
-                })),
-                guild_id: None,
-                guild_locale: None,
-                id: Id::new(1),
-                kind: InteractionType::ModalSubmit,
-                locale: None,
-                member: None,
-                message: None,
-                token: "yeet lol".into(),
-                user: None,
-            }).await;
 
         }));
         let handler = Arc::into_inner(handler).expect("outsanding references to the handler");
